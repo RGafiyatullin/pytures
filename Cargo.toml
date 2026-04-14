@@ -1,0 +1,8 @@
+[package]
+name = "pytures"
+version = "0.0.0"
+edition = "2024"
+description = "Bridging Rust Futures and Python Coroutines"
+license = "BSD-3-Clause"
+
+[dependencies]
