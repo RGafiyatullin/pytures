@@ -1,8 +1,25 @@
 [package]
-name = "pytures"
-version = "0.0.0"
-edition = "2024"
+authors = ["Raman Hafiyatulin <r.gafiyatullin@me.com>"]
+categories = ["api-bindings", "asynchronous"]
 description = "Bridging Rust Futures and Python Coroutines"
+edition = "2024"
+keywords = ["python", "pyo3", "async", "future", "coroutine"]
 license = "BSD-3-Clause"
+name = "pytures"
+repository = "https://github.com/RGafiyatullin/pytures"
+rust-version = "1.85"
+version = "0.2.0"
 
 [dependencies]
+pin-project = "^1"
+pyo3 = "^0.28"
+
+[dev-dependencies]
+pyo3 = { version = "^0.28", features = ["auto-initialize"] }
+rand = "0.10"
+tokio = { version = "^1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "time",
+] }
