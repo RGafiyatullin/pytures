@@ -4,16 +4,20 @@
 //! bridging stack by timing how much a `tokio::sleep` deviates from its
 //! expected duration when driven through an asyncio event loop.
 //!
+//! Each task's sleep duration is randomized within ±`jitter_pct`% of the
+//! base delay so that concurrent tasks don't all fire at the same instant.
+//!
 //! ```sh
 //! cargo run -p pytures --example bench_waker_overhead
 //! cargo run -p pytures --example bench_waker_overhead -- --concurrency 100 --delay-ms 50
+//! cargo run -p pytures --example bench_waker_overhead -- --jitter-pct 20
 //! ```
 
 use std::time::{Duration, Instant};
 
 use pyo3::{
-    Py, PyResult, Python, pyclass, pyfunction,
-    types::{PyAnyMethods, PyModule, PyModuleMethods},
+    IntoPyObject, Py, PyResult, Python, pyclass, pyfunction,
+    types::{PyAnyMethods, PyModule, PyModuleMethods, PyTuple},
     wrap_pyfunction,
 };
 use pytures::RustCoroutine;
@@ -21,35 +25,57 @@ use pytures::RustCoroutine;
 #[pyclass]
 struct RustInstant {
     instant: Instant,
+    delay_nanos: u128,
 }
 
 #[pyfunction]
-fn rust_sleep(py: Python<'_>, delay_ms: u64) -> PyResult<Py<RustCoroutine>> {
+fn rust_sleep(py: Python<'_>, delay_ms: u64, jitter_pct: u64) -> PyResult<Py<RustCoroutine>> {
     Py::new(
         py,
         RustCoroutine::new(async move {
+            let actual_ms = if jitter_pct == 0 {
+                delay_ms
+            } else {
+                let lo = delay_ms.saturating_sub(delay_ms * jitter_pct / 100);
+                let hi = delay_ms + delay_ms * jitter_pct / 100;
+                rand::random_range(lo..=hi)
+            };
             let instant = Instant::now();
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            Python::attach(|py| Ok(Py::new(py, RustInstant { instant })?.into_any()))
+            tokio::time::sleep(Duration::from_millis(actual_ms)).await;
+            let delay_nanos = actual_ms as u128 * 1_000_000;
+            Python::attach(|py| {
+                Ok(Py::new(
+                    py,
+                    RustInstant {
+                        instant,
+                        delay_nanos,
+                    },
+                )?
+                .into_any())
+            })
         }),
     )
 }
 
 #[pyfunction]
-fn rust_elapsed_nanos(instant: &RustInstant) -> u128 {
-    instant.instant.elapsed().as_nanos()
+fn rust_elapsed_nanos<'py>(
+    py: Python<'py>,
+    instant: &RustInstant,
+) -> PyResult<pyo3::Bound<'py, PyTuple>> {
+    let elapsed = instant.instant.elapsed().as_nanos();
+    (instant.delay_nanos, elapsed).into_pyobject(py)
 }
 
 const PYTHON_CODE: &std::ffi::CStr = c"import asyncio
 
-async def run_one(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms):
-    instant = await rust_sleep_fn(delay_ms)
+async def run_one(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms, jitter_pct):
+    instant = await rust_sleep_fn(delay_ms, jitter_pct)
     return rust_elapsed_nanos_fn(instant)
 
-async def main(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms, concurrency):
+async def main(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms, jitter_pct, concurrency):
     tasks = [
         asyncio.create_task(
-            run_one(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms)
+            run_one(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms, jitter_pct)
         )
         for _ in range(concurrency)
     ]
@@ -58,6 +84,7 @@ async def main(rust_sleep_fn, rust_elapsed_nanos_fn, delay_ms, concurrency):
 
 struct Config {
     delay_ms: u64,
+    jitter_pct: u64,
     concurrency: usize,
     iterations: usize,
 }
@@ -66,6 +93,7 @@ fn parse_args() -> Config {
     let args: Vec<String> = std::env::args().collect();
     let mut config = Config {
         delay_ms: 100,
+        jitter_pct: 10,
         concurrency: 10,
         iterations: 10,
     };
@@ -75,6 +103,10 @@ fn parse_args() -> Config {
         match args[i].as_str() {
             "--delay-ms" => {
                 config.delay_ms = args[i + 1].parse().expect("invalid --delay-ms value");
+                i += 2;
+            }
+            "--jitter-pct" => {
+                config.jitter_pct = args[i + 1].parse().expect("invalid --jitter-pct value");
                 i += 2;
             }
             "--concurrency" => {
@@ -87,7 +119,8 @@ fn parse_args() -> Config {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: bench_waker_overhead [OPTIONS]");
-                eprintln!("  --delay-ms N      sleep duration in ms (default: 100)");
+                eprintln!("  --delay-ms N      base sleep duration in ms (default: 100)");
+                eprintln!("  --jitter-pct N    randomize delay by +/-N%% (default: 10)");
                 eprintln!("  --concurrency N   concurrent asyncio tasks (default: 10)");
                 eprintln!("  --iterations N    number of rounds (default: 10)");
                 std::process::exit(0);
@@ -102,11 +135,10 @@ fn parse_args() -> Config {
     config
 }
 
-fn report_stats(elapsed_nanos: &[u128], config: &Config) {
-    let delay_nanos = config.delay_ms as u128 * 1_000_000;
-    let deviations: Vec<f64> = elapsed_nanos
+fn report_stats(samples: &[(u128, u128)], config: &Config) {
+    let deviations: Vec<f64> = samples
         .iter()
-        .map(|&e| e.saturating_sub(delay_nanos) as f64 / 1_000.0)
+        .map(|&(delay_nanos, elapsed)| elapsed.saturating_sub(delay_nanos) as f64 / 1_000.0)
         .collect();
 
     let n = deviations.len() as f64;
@@ -117,7 +149,10 @@ fn report_stats(elapsed_nanos: &[u128], config: &Config) {
     let stddev = variance.sqrt();
 
     println!("=== Waker Overhead Benchmark ===");
-    println!("  delay:       {} ms", config.delay_ms);
+    println!(
+        "  delay:       {} ms (+/-{}%)",
+        config.delay_ms, config.jitter_pct
+    );
     println!("  concurrency: {}", config.concurrency);
     println!("  iterations:  {}", config.iterations);
     println!("  samples:     {}", deviations.len());
@@ -134,16 +169,17 @@ async fn main() {
     let config = parse_args();
 
     eprintln!(
-        "running {} iterations, concurrency={}, delay={}ms",
-        config.iterations, config.concurrency, config.delay_ms,
+        "running {} iterations, concurrency={}, delay={}ms (+/-{}%)",
+        config.iterations, config.concurrency, config.delay_ms, config.jitter_pct,
     );
 
     let delay_ms = config.delay_ms;
+    let jitter_pct = config.jitter_pct;
     let concurrency = config.concurrency;
     let iterations = config.iterations;
 
-    let all_nanos = tokio::task::spawn_blocking(move || {
-        Python::attach(|py| -> PyResult<Vec<u128>> {
+    let samples = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| -> PyResult<Vec<(u128, u128)>> {
             let module = PyModule::new(py, "bench_helpers")?;
             module.add_function(wrap_pyfunction!(rust_sleep, &module)?)?;
             module.add_function(wrap_pyfunction!(rust_elapsed_nanos, &module)?)?;
@@ -153,24 +189,25 @@ async fn main() {
             let sleep_fn = module.getattr("rust_sleep")?;
             let elapsed_fn = module.getattr("rust_elapsed_nanos")?;
 
-            let mut all_nanos = Vec::with_capacity(concurrency * iterations);
+            let mut samples = Vec::with_capacity(concurrency * iterations);
 
             for i in 0..iterations {
                 eprint!("  iteration {}/{}...", i + 1, iterations);
 
-                let py_coro = main_fn.call1((&sleep_fn, &elapsed_fn, delay_ms, concurrency))?;
+                let py_coro =
+                    main_fn.call1((&sleep_fn, &elapsed_fn, delay_ms, jitter_pct, concurrency))?;
 
                 let asyncio = py.import("asyncio")?;
                 let event_loop = asyncio.call_method0("new_event_loop")?;
                 let result = event_loop.call_method1("run_until_complete", (&py_coro,))?;
                 event_loop.call_method0("close")?;
 
-                let nanos: Vec<u128> = result.extract()?;
+                let batch: Vec<(u128, u128)> = result.extract()?;
                 eprintln!(" done");
-                all_nanos.extend(nanos);
+                samples.extend(batch);
             }
 
-            Ok(all_nanos)
+            Ok(samples)
         })
     })
     .await
@@ -178,5 +215,5 @@ async fn main() {
     .unwrap();
 
     println!();
-    report_stats(&all_nanos, &config);
+    report_stats(&samples, &config);
 }
