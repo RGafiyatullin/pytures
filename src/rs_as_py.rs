@@ -34,12 +34,14 @@ fn get_running_loop_fn(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 #[pyclass(unsendable)]
 pub struct RustCoroutine {
     future: Option<BoxFuture>,
+    waker_future: Option<Py<PyAny>>,
 }
 
 impl RustCoroutine {
     pub fn new(future: impl Future<Output = PyResult<Py<PyAny>>> + 'static) -> Self {
         Self {
             future: Some(Box::pin(future)),
+            waker_future: None,
         }
     }
 }
@@ -78,6 +80,10 @@ impl RustCoroutine {
             .take()
             .ok_or_else(|| PyStopIteration::new_err(()))?;
 
+        if let Some(prev) = self.waker_future.take() {
+            prev.bind(py).call_method0(pyo3::intern!(py, "cancel")).ok();
+        }
+
         match get_running_loop_fn(py)?.bind(py).call0() {
             Ok(event_loop) => {
                 let py_future = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
@@ -99,7 +105,9 @@ impl RustCoroutine {
                     }
                     Poll::Pending => {
                         self.future = Some(future);
-                        Ok(py_future.unbind())
+                        let py_future = py_future.unbind();
+                        self.waker_future = Some(py_future.clone_ref(py));
+                        Ok(py_future)
                     }
                 }
             }
@@ -122,11 +130,18 @@ impl RustCoroutine {
     }
 
     fn throw(&mut self, exc: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py = exc.py();
+        if let Some(wf) = self.waker_future.take() {
+            wf.bind(py).call_method0(pyo3::intern!(py, "cancel")).ok();
+        }
         self.future = None;
         Err(PyErr::from_value(exc))
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, py: Python<'_>) {
+        if let Some(wf) = self.waker_future.take() {
+            let _ = wf.bind(py).call_method0(pyo3::intern!(py, "cancel"));
+        }
         self.future = None;
     }
 }
