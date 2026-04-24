@@ -34,12 +34,14 @@ fn get_running_loop_fn(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 #[pyclass(unsendable)]
 pub struct RustCoroutine {
     future: Option<BoxFuture>,
+    waker_future: Option<Py<PyAny>>,
 }
 
 impl RustCoroutine {
     pub fn new(future: impl Future<Output = PyResult<Py<PyAny>>> + 'static) -> Self {
         Self {
             future: Some(Box::pin(future)),
+            waker_future: None,
         }
     }
 }
@@ -78,6 +80,10 @@ impl RustCoroutine {
             .take()
             .ok_or_else(|| PyStopIteration::new_err(()))?;
 
+        if let Some(prev) = self.waker_future.take() {
+            prev.bind(py).call_method0(pyo3::intern!(py, "cancel")).ok();
+        }
+
         match get_running_loop_fn(py)?.bind(py).call0() {
             Ok(event_loop) => {
                 let py_future = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
@@ -99,7 +105,9 @@ impl RustCoroutine {
                     }
                     Poll::Pending => {
                         self.future = Some(future);
-                        Ok(py_future.unbind())
+                        let py_future = py_future.unbind();
+                        self.waker_future = Some(py_future.clone_ref(py));
+                        Ok(py_future)
                     }
                 }
             }
@@ -122,11 +130,18 @@ impl RustCoroutine {
     }
 
     fn throw(&mut self, exc: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py = exc.py();
+        if let Some(wf) = self.waker_future.take() {
+            wf.bind(py).call_method0(pyo3::intern!(py, "cancel")).ok();
+        }
         self.future = None;
         Err(PyErr::from_value(exc))
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, py: Python<'_>) {
+        if let Some(wf) = self.waker_future.take() {
+            let _ = wf.bind(py).call_method0(pyo3::intern!(py, "cancel"));
+        }
         self.future = None;
     }
 }
@@ -163,6 +178,84 @@ mod tests {
     use pyo3::{IntoPyObject, types::PyModule};
 
     use super::*;
+
+    /// Drives a RustCoroutine by calling `send()` in a tight loop (without
+    /// yielding to the event loop between calls). Each `send()` that returns
+    /// `Pending` yields a new Python future. With the fix, the *previous*
+    /// future is cancelled at the top of every `send()`. Without it the
+    /// futures stay pending and accumulate.
+    ///
+    /// To reproduce the bug, comment out the `waker_future.take() + cancel`
+    /// block in `send()` (lines 83-85 of rs_as_py.rs).
+    #[tokio::test]
+    async fn waker_future_cancelled_on_repoll() {
+        let _guard = crate::PYTHON_TEST_MUTEX.lock().unwrap();
+        tokio::task::spawn_blocking(|| {
+            Python::attach(|py| -> PyResult<()> {
+                let module = PyModule::from_code(
+                    py,
+                    c"
+async def drive_and_check(coro, expected_pending_polls):
+    futures = []
+    try:
+        while True:
+            f = coro.send(None)
+            futures.append(f)
+    except StopIteration as e:
+        result = e.value
+
+    cancelled = sum(1 for f in futures if f.cancelled())
+    assert cancelled == len(futures), (
+        f'expected all {len(futures)} waker futures to be cancelled, '
+        f'but only {cancelled} were'
+    )
+    assert len(futures) == expected_pending_polls, (
+        f'expected {expected_pending_polls} pending polls, got {len(futures)}'
+    )
+    return result
+",
+                    c"test_waker_leak.py",
+                    c"test_waker_leak",
+                )?;
+                let drive_and_check = module.getattr("drive_and_check")?;
+
+                const PENDING_POLLS: usize = 5;
+
+                let rust_coro = Py::new(
+                    py,
+                    RustCoroutine::new(async {
+                        for _ in 0..PENDING_POLLS {
+                            let mut yielded = false;
+                            std::future::poll_fn(|cx| {
+                                if yielded {
+                                    Poll::Ready(())
+                                } else {
+                                    yielded = true;
+                                    cx.waker().wake_by_ref();
+                                    Poll::Pending
+                                }
+                            })
+                            .await;
+                        }
+                        Python::attach(|py| Ok(42i32.into_pyobject(py)?.into_any().unbind()))
+                    }),
+                )?;
+
+                let py_coro = drive_and_check.call1((rust_coro, PENDING_POLLS))?;
+
+                let asyncio = py.import("asyncio")?;
+                let event_loop = asyncio.call_method0("new_event_loop")?;
+                let result = event_loop.call_method1("run_until_complete", (&py_coro,))?;
+                event_loop.call_method0("close")?;
+
+                assert_eq!(result.extract::<i32>()?, 42);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn nested_tokio_sleep_through_python_event_loop() {
